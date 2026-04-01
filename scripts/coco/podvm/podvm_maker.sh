@@ -1,10 +1,14 @@
 #! /bin/bash
 
+# Detect architecture (should be set by parent script, but fallback to detection)
+ARCH=${ARCH:-$(uname -m)}
+CENTOS_MIRROR_ARCH=${CENTOS_MIRROR_ARCH:-$ARCH}
+
 # See SM_REGISTER in scripts/coco/coco-components.sh for subscription-manager setup
 if subscription-manager identity &>/dev/null; then
     dnf install -y afterburn e2fsprogs && dnf clean all
 else
-    dnf config-manager --add-repo=https://mirror.stream.centos.org/10-stream/AppStream/x86_64/os/ && dnf install -y --nogpgcheck afterburn e2fsprogs && dnf clean all && dnf config-manager --set-disabled "*centos*"
+    dnf config-manager --add-repo=https://mirror.stream.centos.org/10-stream/AppStream/${CENTOS_MIRROR_ARCH}/os/ && dnf install -y --nogpgcheck afterburn e2fsprogs && dnf clean all && dnf config-manager --set-disabled "*centos*"
 fi
 
 cat <<EOF > /etc/systemd/system/afterburn-checkin.service

@@ -1,5 +1,7 @@
 # How to create a dm-verity image via container
 
+## For x86_64 Architecture
+
 1. Download official RHEL ISO and build a CVM with `helpers/rhel10-dm-root.ks`:
 ```
 ISO_PATH=rhel-10.0-x86_64-dvd.iso
@@ -11,9 +13,29 @@ virt-install --virt-type kvm --os-variant rhel10.0 --arch x86_64 --boot uefi --n
 
 Image will be stored in `~/.local/share/libvirt/images/$QCOW2_NAME.qcow2`
 
-2. Do custom modifications in the image
+## For s390x Architecture
 
-3. Optional: if not available, generate private key, PEM and DER certificates using `helpers/create-certs.sh`. This is only needed if secureboot has to be enabled.
+1. Download official RHEL ISO for s390x and build a CVM with `helpers/rhel10-dm-root-s390x.ks`:
+```
+ISO_PATH=rhel-10.0-s390x-dvd.iso
+KS_LOCATION=helpers/rhel10-dm-root-s390x.ks
+QCOW2_NAME=my-image-s390x
+
+virt-install --virt-type kvm --os-variant rhel10.0 --arch s390x --name $QCOW2_NAME --memory 8192 --location $ISO_PATH --disk bus=virtio,size=7 --initrd-inject=$KS_LOCATION --nographics --extra-args "console=ttysclp0 inst.ks=file:/rhel10-dm-root-s390x.ks" --transient
+```
+
+Image will be stored in `~/.local/share/libvirt/images/$QCOW2_NAME.qcow2`
+
+**Note**: s390x uses zipl bootloader instead of UEFI, and requires different console device (ttysclp0).
+
+2. Set the architecture environment variable (if building for s390x):
+```
+export ARCH=s390x
+```
+
+3. Do custom modifications in the image
+
+4. Optional: if not available, generate private key, PEM and DER certificates using `helpers/create-certs.sh`. This is only needed if secureboot has to be enabled (x86_64 only).
 ```
 Usage: ./helpers/create-certs.sh <OUTPUT_FOLDER>
 Usage: ./helpers/create-certs.sh help
@@ -25,12 +47,12 @@ Options (define them as variable):
 SB_CERT_NAME:  optional  - name of the secureboot certificate added into the gallery. Default: My custom certificate
 ```
 
-4. Build the container (if `dnf install` fails, make sure podman has logged into your RHEL account)
+5. Build the container (if `dnf install` fails, make sure podman has logged into your RHEL account)
 ```
-sudo podman build my-coco-podvm .
+sudo podman build -t my-coco-podvm .
 ```
 
-5. Export the following mandatory variables
+6. Export the following mandatory variables
 ```
 QCOW2=path/where/qcow2/is
 ```
@@ -40,28 +62,29 @@ IMAGE_CERTIFICATE_PEM=path/where/pem_cert/is
 IMAGE_PRIVATE_KEY=path/where/private_key/is
 ```
 
-6. Optionally, define additional variables used by `scripts/create-verity-podvm.sh` running inside the container: (usage message available also with `create-verity-podvm.sh help`)
+7. Optionally, define additional variables used by `scripts/create-verity-podvm.sh` running inside the container: (usage message available also with `create-verity-podvm.sh help`)
 ```
 Usage: ./create-verity-podvm.sh <INPUT_IMAGE>
 Usage: ./create-verity-podvm.sh help
 
 The purpose of this script is to take a disk and:
-1. create new certificates for the new image secureboot db, if not provided
+1. create new certificates for the new image secureboot db, if not provided (x86_64 only)
 2. install coco guest components in the disk
 3. call verity script to verity protect the root disk
 
 Options (define them as variable):
-IMAGE_CERTIFICATE_DER:      optional  - certificate in DER format to upload in the gallery. Default: generate a new one
-IMAGE_CERTIFICATE_PEM:      optional  - certificate in PEM format to upload in the gallery. Default: generate a new one
-IMAGE_PRIVATE_KEY:          optional   - key to sign the verity cmdline addon. Default: generate a new one
-SB_CERT_NAME:               optional   - name of the secureboot certificate added into the gallery. Default: My custom certificate
+ARCH:                       optional   - target architecture (x86_64 or s390x). Default: auto-detect
+IMAGE_CERTIFICATE_DER:      optional  - certificate in DER format to upload in the gallery (x86_64 only). Default: generate a new one
+IMAGE_CERTIFICATE_PEM:      optional  - certificate in PEM format to upload in the gallery (x86_64 only). Default: generate a new one
+IMAGE_PRIVATE_KEY:          optional   - key to sign the verity cmdline addon (x86_64 only). Default: generate a new one
+SB_CERT_NAME:               optional   - name of the secureboot certificate added into the gallery (x86_64 only). Default: My custom certificate
 WORK_FOLDER:                optional   - where to create artifacts. Defaults to a temp folder in /tmp
 
 Verity options (define them as variable):
 RESIZE_DISK:                optional   - whether to increase disk size by 10% to accomodate verity partition. Default: yes
 NBD_DEV:                    optional   - nbd$NBD_DEV where to temporarily mount the disk. Default: 0
 VERITY_SCRIPT_LOCATION:     optional   - location of the verity.sh script. Default: ./verity.sh
-ROOT_PARTITION_UUID:        optional   - UUID to find the root. Defaults to the x86_64 part type
+ROOT_PARTITION_UUID:        optional   - UUID to find the root. Defaults to architecture-specific part type
 
 CoCo guest options (define them as variable):
 
@@ -74,10 +97,13 @@ ROOT_PASSWORD:              optional   - set root's password. Default: disabled
 
 ```
 
-7. Run the container. To add the optional exported variables, just add `-e YOUR_VAR=$YOUR_VAR`.
+8. Run the container. To add the optional exported variables, just add `-e YOUR_VAR=$YOUR_VAR`.
+
+For x86_64:
 ```
 sudo podman run --rm \
     --privileged \
+    -e ARCH=x86_64 \
     -v $QCOW2:/disk.qcow2 \
     -v $IMAGE_CERTIFICATE_PEM:/public.pem \
     -v $IMAGE_PRIVATE_KEY:/private.key \
@@ -87,11 +113,27 @@ sudo podman run --rm \
     --security-opt=seccomp=unconfined \
     --mount type=bind,source=/dev,target=/dev \
     --mount type=bind,source=/run/udev,target=/run/udev \
-    coco-podvm
+    my-coco-podvm
 ```
+
+For s390x (no certificates needed):
+```
+sudo podman run --rm \
+    --privileged \
+    -e ARCH=s390x \
+    -v $QCOW2:/disk.qcow2 \
+    -v /lib/modules:/lib/modules \
+    --user 0 \
+    --security-opt=apparmor=unconfined \
+    --security-opt=seccomp=unconfined \
+    --mount type=bind,source=/dev,target=/dev \
+    --mount type=bind,source=/run/udev,target=/run/udev \
+    my-coco-podvm
+```
+
 As a result, the input image will contain coco-components and be dm-verity protected.
 
-8. Optionally, upload yourself the image on Azure image gallery using `azure/upload-azure.sh`. In order to use that script, define the following variables (usage message available also by running `azure/upload-azure.sh help`):
+9. Optionally, upload yourself the image on Azure image gallery using `azure/upload-azure.sh` (x86_64 only - Azure does not support s390x). In order to use that script, define the following variables (usage message available also by running `azure/upload-azure.sh help`):
 ```
 Usage: azure/upload-azure.sh <INPUT_IMAGE> [<DER_CERTIFICATE>]
 Usage: azure/upload-azure.sh help

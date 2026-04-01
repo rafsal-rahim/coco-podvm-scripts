@@ -9,6 +9,10 @@ here=`pwd`
 SCRIPT_FOLDER=$(dirname $0)
 SCRIPT_FOLDER=$(realpath $SCRIPT_FOLDER)
 
+# Source architecture detection
+source "$SCRIPT_FOLDER/common/arch-detect.sh"
+detect_arch
+
 function local_help()
 {
     echo "Usage: $0 <INPUT_IMAGE>"
