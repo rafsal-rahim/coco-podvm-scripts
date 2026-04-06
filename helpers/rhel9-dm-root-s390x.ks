@@ -38,15 +38,15 @@ skipx
 # poweroff
 reboot
 
-%pre --erroronfail
-sfdisk --wipe always -X gpt /dev/sda << EOF
-2048,2097152,0FC63DAF-8483-4772-8E79-3D69D8477DE4
-,5242880,5EEAD9A9-FE09-4A1E-A1D7-520D00531306
-EOF
-%end
+# Generated using Blivet version 3.6.0
+ignoredisk --only-use=vda
+# Partition clearing information
+clearpart --all --initlabel
 
-part /boot --onpart=sda1 --fstype ext4
-part / --onpart=sda2 --fstype ext4
+# Disk partitioning information for s390x
+# s390x uses /boot partition instead of EFI
+part /boot --fstype="xfs" --ondisk=vda --size=1024 --label=boot
+part / --fstype="xfs" --ondisk=vda --size=1 --grow --label=root
 
 %packages
 @^minimal-environment
