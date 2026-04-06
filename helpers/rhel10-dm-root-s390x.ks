@@ -81,27 +81,31 @@ e2fsprogs
 firstboot --disable
 
 # Generated using Blivet version 3.6.0
-ignoredisk --only-use=sda
+ignoredisk --only-use=vda
 # Partition clearing information
-clearpart --none --initlabel
+clearpart --all --initlabel
 
 # Disk partitioning information for s390x
 # s390x uses /boot partition instead of EFI
-part /boot --fstype="ext4" --ondisk=sda --size=1024 --fsoptions="defaults"
-part / --fstype="ext4" --ondisk=sda --grow --maxsize=0
+part /boot --fstype="ext4" --ondisk=vda --size=1024 --fsoptions="defaults"
+part / --fstype="xfs" --ondisk=vda --grow
 
 %post --erroronfail
 
 # installer may change partition GUIDs
 
 # Linux root (s390x):
-sfdisk --part-type /dev/sda 2 5EEAD9A9-FE09-4A1E-A1D7-520D00531306
+sfdisk --part-type /dev/vda 2 5EEAD9A9-FE09-4A1E-A1D7-520D00531306
 
 # Install and configure zipl bootloader for s390x
 echo "Configuring zipl bootloader..."
 
+# Get the kernel version
+KERNEL_VERSION=$(ls /boot/vmlinuz-* | sed 's/.*vmlinuz-//' | head -1)
+ROOT_UUID=$(blkid -s UUID -o value /dev/vda2)
+
 # Create zipl configuration
-cat > /etc/zipl.conf << 'EOF'
+cat > /etc/zipl.conf << EOF
 [defaultboot]
 defaultauto
 prompt=1
@@ -110,9 +114,9 @@ default=linux
 target=/boot
 
 [linux]
-image=/boot/vmlinuz-$(uname -r)
-ramdisk=/boot/initramfs-$(uname -r).img
-parameters="root=UUID=$(blkid -s UUID -o value /dev/sda2) console=ttysclp0"
+image=/boot/vmlinuz-${KERNEL_VERSION}
+ramdisk=/boot/initramfs-${KERNEL_VERSION}.img
+parameters="root=UUID=${ROOT_UUID} console=ttysclp0"
 EOF
 
 # Run zipl to install bootloader

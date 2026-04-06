@@ -20,10 +20,17 @@ RUN curl -O https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.r
     rm epel-release-latest-9.noarch.rpm
 
 # Install virt-customize and dependencies
-RUN dnf install -y guestfs-tools libguestfs-tools sbsigntools
+# sbsigntools is only available on x86_64 (used for UEFI Secure Boot signing)
+# s390x uses zipl bootloader and doesn't need sbsigntools
+RUN dnf install -y guestfs-tools libguestfs-tools && \
+    if [ "$(uname -m)" = "x86_64" ]; then \
+        dnf install -y sbsigntools || echo "sbsigntools not available, skipping"; \
+    fi && \
+    dnf clean all
 
-# scripts
+# scripts - copy all scripts including common directory
 ADD scripts /scripts
+ADD helpers /helpers
 
 # to make virt-customize work
 ENV LIBGUESTFS_BACKEND=direct

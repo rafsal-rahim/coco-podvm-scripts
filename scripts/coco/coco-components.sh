@@ -9,9 +9,18 @@ SCRIPT_FOLDER=$(realpath $SCRIPT_FOLDER)
 source "$SCRIPT_FOLDER/../common/arch-detect.sh"
 detect_arch
 
-PODVM_BINARY_DEF=quay.io/redhat-user-workloads/ose-osc-tenant/osc-podvm-payload@sha256:b14cce805fe56da2fd4bb584b786be5f6b92eda87482dd7399ef84793f202684
+# Architecture-aware image selection
+# Commit: 54906f81c0bf33972a06073fbcad04b5db68cea3
+# Use architecture-specific tags: <commit>-linux-s390x or <commit>-linux-x86-64
+if [ "$ARCH" = "s390x" ]; then
+    PODVM_BINARY_DEF=quay.io/redhat-user-workloads/ose-osc-tenant/osc-podvm-payload:54906f81c0bf33972a06073fbcad04b5db68cea3-linux-s390x
+    PAUSE_BUNDLE_DEF=quay.io/redhat-user-workloads/ose-osc-tenant/osc-podvm-payload:54906f81c0bf33972a06073fbcad04b5db68cea3-linux-s390x
+else
+    # Default to x86_64
+    PODVM_BINARY_DEF=quay.io/redhat-user-workloads/ose-osc-tenant/osc-podvm-payload:54906f81c0bf33972a06073fbcad04b5db68cea3-linux-x86-64
+    PAUSE_BUNDLE_DEF=quay.io/redhat-user-workloads/ose-osc-tenant/osc-podvm-payload:54906f81c0bf33972a06073fbcad04b5db68cea3-linux-x86-64
+fi
 PODVM_BINARY_LOCATION_DEF=/podvm-binaries.tar.gz
-PAUSE_BUNDLE_DEF=quay.io/redhat-user-workloads/ose-osc-tenant/osc-podvm-payload@sha256:b14cce805fe56da2fd4bb584b786be5f6b92eda87482dd7399ef84793f202684
 PAUSE_BUNDLE_LOCATION_DEF=/pause-bundle.tar.gz
 
 function local_help()
