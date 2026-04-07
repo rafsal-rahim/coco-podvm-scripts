@@ -35,13 +35,12 @@ timezone Etc/UTC --utc
 skipx
 
 # Power down the machine after install
-# poweroff
-reboot
+poweroff
 
 # Generated using Blivet version 3.6.0
 ignoredisk --only-use=vda
 # Partition clearing information
-clearpart --all --initlabel
+clearpart --all --initlabel --drives=vda
 
 # Disk partitioning information for s390x
 # s390x uses /boot partition instead of EFI
