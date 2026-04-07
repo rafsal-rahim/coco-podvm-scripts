@@ -41,6 +41,16 @@ skipx
 poweroff
 #reboot
 
+%pre --erroronfail
+# Create GPT partition table with proper partition types for s390x
+# Partition 1: /boot (1GB, Linux filesystem)
+# Partition 2: / (rest of disk, Linux root s390x)
+sfdisk --wipe always -X gpt /dev/vda << EOF
+2048,2097152,0FC63DAF-8483-4772-8E79-3D69D8477DE4
+,,5EEAD9A9-FE09-4A1E-A1D7-520D00531306
+EOF
+%end
+
 %packages
 @^minimal-environment
 openssh-server
@@ -79,19 +89,6 @@ e2fsprogs
 
 # Run the Setup Agent on first boot
 firstboot --disable
-
-# Generated using Blivet version 3.6.0
-ignoredisk --only-use=vda
-
-%pre --erroronfail
-# Create GPT partition table with proper partition types for s390x
-# Partition 1: /boot (1GB, Linux filesystem)
-# Partition 2: / (rest of disk, Linux root s390x)
-sfdisk --wipe always -X gpt /dev/vda << EOF
-2048,2097152,0FC63DAF-8483-4772-8E79-3D69D8477DE4
-,+,5EEAD9A9-FE09-4A1E-A1D7-520D00531306
-EOF
-%end
 
 part /boot --onpart=vda1 --fstype=ext4
 part / --onpart=vda2 --fstype=xfs

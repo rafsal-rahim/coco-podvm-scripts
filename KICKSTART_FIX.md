@@ -6,7 +6,11 @@ The s390x kickstart files were failing to create partitions during installation,
 
 ## Root Cause
 
-The kickstart files were using Anaconda's automatic partition creation (`part /boot --ondisk=vda --size=1024`) instead of pre-creating partitions with explicit GPT partition types like the x86_64 version does.
+The kickstart files had **three critical issues**:
+
+1. **Missing %pre section**: Unlike the working x86_64 version, the s390x kickstarts were using Anaconda's automatic partition creation instead of pre-creating partitions with explicit GPT partition types
+2. **Incorrect sfdisk syntax**: Used `,+,` for the second partition size instead of `,,` (empty size = use remaining space)
+3. **Unnecessary ignoredisk directive**: The `ignoredisk --only-use=vda` directive was present but not needed (x86_64 version doesn't use it)
 
 **Key difference between x86_64 and s390x kickstarts:**
 
@@ -46,15 +50,13 @@ Added a `%pre` section to both s390x kickstart files that:
 
 ### Fixed s390x kickstart structure:
 ```kickstart
-ignoredisk --only-use=vda
-
 %pre --erroronfail
 # Create GPT partition table with proper partition types for s390x
 # Partition 1: /boot (1GB, Linux filesystem)
 # Partition 2: / (rest of disk, Linux root s390x)
 sfdisk --wipe always -X gpt /dev/vda << EOF
 2048,2097152,0FC63DAF-8483-4772-8E79-3D69D8477DE4
-,+,5EEAD9A9-FE09-4A1E-A1D7-520D00531306
+,,5EEAD9A9-FE09-4A1E-A1D7-520D00531306
 EOF
 %end
 
@@ -62,9 +64,16 @@ part /boot --onpart=vda1 --fstype=xfs
 part / --onpart=vda2 --fstype=xfs
 ```
 
+**Key changes:**
+- Removed `ignoredisk --only-use=vda` (not needed)
+- Changed `,+,` to `,,` in sfdisk (empty size field = use all remaining space)
+- Moved %pre section to proper location (before %packages)
+
 ## Additional Changes
 
-Removed the redundant `sfdisk --part-type` command from the `%post` section since partition types are now set correctly in the `%pre` section.
+1. **Removed redundant `sfdisk --part-type`** from the `%post` section since partition types are now set correctly in the `%pre` section
+2. **Removed `ignoredisk` directive** - not needed and may interfere with %pre partitioning
+3. **Fixed sfdisk syntax** - changed `,+,` to `,,` for "use remaining space"
 
 ## Files Modified
 
