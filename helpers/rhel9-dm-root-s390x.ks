@@ -39,13 +39,19 @@ poweroff
 
 # Generated using Blivet version 3.6.0
 ignoredisk --only-use=vda
-# Partition clearing information
-clearpart --all --initlabel --drives=vda
 
-# Disk partitioning information for s390x
-# s390x uses /boot partition instead of EFI
-part /boot --fstype="xfs" --ondisk=vda --size=1024 --label=boot
-part / --fstype="xfs" --ondisk=vda --size=1 --grow --label=root
+%pre --erroronfail
+# Create GPT partition table with proper partition types for s390x
+# Partition 1: /boot (1GB, Linux filesystem)
+# Partition 2: / (rest of disk, Linux root s390x)
+sfdisk --wipe always -X gpt /dev/vda << EOF
+2048,2097152,0FC63DAF-8483-4772-8E79-3D69D8477DE4
+,+,5EEAD9A9-FE09-4A1E-A1D7-520D00531306
+EOF
+%end
+
+part /boot --onpart=vda1 --fstype=xfs
+part / --onpart=vda2 --fstype=xfs
 
 %packages
 @^minimal-environment
@@ -82,9 +88,6 @@ e2fsprogs
 %end
 
 %post --erroronfail
-# installer may change partition GUIDs. Linux root (s390x):
-sfdisk --part-type /dev/vda 2 5EEAD9A9-FE09-4A1E-A1D7-520D00531306
-
 # Install and configure zipl bootloader for s390x
 echo "Configuring zipl bootloader..."
 
