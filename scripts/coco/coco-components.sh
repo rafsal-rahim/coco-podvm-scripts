@@ -6,7 +6,7 @@ SCRIPT_FOLDER=${SCRIPT_FOLDER:-$(dirname $0)}
 SCRIPT_FOLDER=$(realpath $SCRIPT_FOLDER)
 
 # Source architecture detection
-source "$SCRIPT_FOLDER/../common/arch-detect.sh"
+source "$SCRIPT_FOLDER/common/arch-detect.sh"
 detect_arch
 
 # Architecture-aware image selection
