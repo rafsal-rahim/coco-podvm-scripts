@@ -3,7 +3,13 @@ set -ex
 
 # Detect architecture (should be set by parent script, but fallback to detection)
 ARCH=${ARCH:-$(uname -m)}
-USES_UEFI=${USES_UEFI:-"yes"}
+
+# Determine if this architecture uses UEFI based on detected architecture
+if [ "$ARCH" = "s390x" ]; then
+    USES_UEFI=${USES_UEFI:-"no"}
+else
+    USES_UEFI=${USES_UEFI:-"yes"}
+fi
 
 export KERNEL_VERSION=6.12.0-124.21.1.el10_1
 
