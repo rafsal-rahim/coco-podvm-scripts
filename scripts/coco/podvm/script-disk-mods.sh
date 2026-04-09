@@ -14,7 +14,14 @@ if [ "$USES_UEFI" = "yes" ]; then
     printf "shimx64.efi,redhat,\\\EFI\\\Linux\\\\"`cat /etc/machine-id`"-"`rpm -q --queryformat %{VERSION}-%{RELEASE}\\\n kernel-uki-virt | tail -1`".x86_64.efi ,UKI bootentry\n" | iconv -f ASCII -t UCS-2 > /boot/efi/EFI/redhat/BOOTX64.CSV
 else
     # s390x: Install standard kernel and update zipl
-    dnf install -y kernel-{modules,modules-extra}-${KERNEL_VERSION} || dnf install -y kernel kernel-modules kernel-modules-extra
+    # Try to install kernel packages if repos are available, otherwise skip
+    if dnf repolist enabled 2>/dev/null | grep -q .; then
+        echo "Repositories available, attempting kernel installation..."
+        dnf install -y kernel-{modules,modules-extra}-${KERNEL_VERSION} || dnf install -y kernel kernel-modules kernel-modules-extra || true
+    else
+        echo "No repositories configured, skipping kernel installation"
+        echo "Assuming kernel is already installed in base image"
+    fi
     
     # Update zipl configuration
     if [ -f /etc/zipl.conf ]; then
