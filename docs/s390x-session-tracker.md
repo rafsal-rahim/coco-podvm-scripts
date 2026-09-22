@@ -8,8 +8,8 @@ If the Bob conversation context is lost, start a new session and say:
 
 ## Current Status
 
-**Stage:** 🔧 **Bug #25 fix applied to script — ready for Stage 2+3 rebuild and boot test**
-**Last updated:** Session 7 — fix applied to `script-disk-mods-s390x.sh`; rebuild required
+**Stage:** 🔧 **Bug #27 diagnosed — `rd.driver.pre=overlay` missing from `virt-install` boot cmdline; add it and reboot**
+**Last updated:** Session 9 — `rd.driver.pre=overlay` added to BLS entries by `verity-s390x.sh`; `virt-install` boot command must also carry it since it overrides the BLS cmdline entirely
 
 ### What happened in session 7
 
@@ -94,15 +94,49 @@ If the Bob conversation context is lost, start a new session and say:
 
 ### Stage 4 — Boot test 🔧 IN PROGRESS
 
-- `systemd-veritysetup@root.service` → **success** ✅ (`/dev/mapper/root` assembled)
-- `sysroot.mount` → **success** ✅ (ext4 ro mounted)
-- `systemd-volatile-root.service` → **failure** ❌ (exits 1 — root cause diagnosed, fix pending)
+- `systemd-veritysetup@root.service` → **success** ✅ (`/dev/mapper/root` assembled, `sha256-s390` hw accel confirmed)
+- `sysroot.mount` → **success** ✅ (ext4 ro mounted, UUID `25416c86-8148-4443-acf4-38b987471e25`)
+- `systemd-volatile-root.service` → **failure** ❌ (exits 1 — Bug #25 `yes`→`overlay` patch confirmed baked in, but `overlay` module not loaded before service runs — Bug #26 fix applied, rebuild required)
 
 ---
 
 ## Active Bug
 
-### Bug #25 — `systemd-volatile-root.service` exits 1: wrong volatile mode (`yes` vs `overlay`)
+### Bug #26 — `overlay` kernel module not loaded before `systemd-volatile-root.service` (race with `systemd-modules-load.service`)
+
+**Symptom:** Same as Bug #25 — `systemd-volatile-root.service` exits 1, emergency shell. But the `yes`→`overlay` patch from Bug #25 is already confirmed baked in.
+
+**Root cause:**
+
+The previous fix used `--add-drivers "overlay"` + `--install /etc/modules-load.d/overlay.conf` in dracut. This puts `overlay.ko` in the initramfs and installs a `modules-load.d` conf that tells `systemd-modules-load.service` to load it.
+
+The problem: `systemd-modules-load.service` and `systemd-volatile-root.service` both sit in `sysinit.target` with no ordering between them. Systemd starts them in parallel. When `systemd-volatile-root.service` wins the race and calls `mount(overlay, ...)` before `systemd-modules-load.service` has run `modprobe overlay`, the kernel returns `ENODEV` and the service exits 1.
+
+Evidence from boot log: **no `overlayfs:` kernel message** appears anywhere between verity success and the volatile-root failure — the module was never loaded.
+
+**Fix — `force_drivers` in `/etc/dracut.conf.d/overlay.conf`:**
+
+`force_drivers` causes dracut to emit an explicit `modprobe overlay` in the **pre-udev hook** (the very first hook in initrd init, before PID 1 systemd starts any units). This eliminates the race entirely — `overlay` is loaded before any service can run.
+
+**Change in [`scripts/coco/podvm/script-disk-mods-s390x.sh`](scripts/coco/podvm/script-disk-mods-s390x.sh:155):**
+
+```bash
+# OLD (racy — leaves loading to systemd-modules-load.service)
+mkdir -p /etc/modules-load.d
+echo "overlay" > /etc/modules-load.d/overlay.conf
+dracut ... --add-drivers "overlay" --install "/etc/modules-load.d/overlay.conf"
+
+# NEW (race-free — modprobe in pre-udev hook, before any systemd unit)
+mkdir -p /etc/dracut.conf.d
+echo 'force_drivers+=" overlay "' > /etc/dracut.conf.d/overlay.conf
+dracut ... --add "systemd-veritysetup"
+```
+
+**Status:** ✅ Fix applied to [`scripts/coco/podvm/script-disk-mods-s390x.sh`](scripts/coco/podvm/script-disk-mods-s390x.sh) — rebuild required.
+
+---
+
+### Bug #25 — `systemd-volatile-root.service` exits 1: wrong volatile mode (`yes` vs `overlay`) ✅ RESOLVED
 
 **Symptom:**
 ```
@@ -196,7 +230,8 @@ dracut picks up `/etc/systemd/system/` drop-ins when building the initramfs — 
 | 22 | `fsck -p` exits 4 on dirty ext4 journal left by `virt-customize` | Changed to `fsck -y` in `verity-s390x.sh` | ✅ |
 | 23 | `veritysetup verify` fails at position 0 — zipl ran after `veritysetup format` | Rewrote `verity-s390x.sh`: BLS patch + zipl first, `veritysetup format` last; roothash not in bootmap | ✅ |
 | 24 | Main kernel BLS entry missing `root=` — Anaconda wrote it to `zipl.conf` only, not to the BLS `.conf`; kickstart-arg strip left no `root=` at all | Guard in `patch_bls_and_run_zipl()`: insert `root=/dev/mapper/root` after `options ` if not already present | ✅ |
-| 25 | `systemd-volatile-root.service` exits 1 — service hardcodes `yes` (VOLATILE_YES / MS_MOVE path) which fails on shared initrd mounts; `overlay` (VOLATILE_OVERLAY / overlayfs) is the correct mode | Drop-in `/etc/systemd/system/systemd-volatile-root.service.d/s390x-overlay.conf` overrides `ExecStart` to use `overlay`; added before dracut rebuild so it is baked into initramfs | ✅ Script fixed — rebuild pending |
+| 25 | `systemd-volatile-root.service` exits 1 — service hardcodes `yes` (VOLATILE_YES / MS_MOVE path) which fails on shared initrd mounts; `overlay` (VOLATILE_OVERLAY / overlayfs) is the correct mode | Direct `sed` patch of `/usr/lib/systemd/system/systemd-volatile-root.service` before dracut (file restored after); drop-in written to `/etc/systemd/system/` for post-pivot_root boots | ✅ Confirmed baked in |
+| 26 | `overlay` module not loaded before `systemd-volatile-root.service` — `--add-drivers` leaves loading to `systemd-modules-load.service` which races with `volatile-root`; `ENODEV` on overlayfs mount → service exits 1 | `force_drivers+=" overlay "` in `/etc/dracut.conf.d/overlay.conf` — dracut emits `modprobe overlay` in pre-udev hook before any systemd unit starts | ✅ Script fixed — rebuild pending |
 
 ---
 
@@ -433,22 +468,12 @@ sudo veritysetup verify /dev/nbd4p2 /dev/nbd4p3 "$ROOTHASH"
 sudo qemu-nbd --disconnect /dev/nbd4
 ```
 
-### Step 3 — Apply Bug #25 fix and rebuild ← CURRENT STEP
+### Step 3 — Bug #27 fix: add `rd.driver.pre=overlay` to boot command ← CURRENT STEP
 
-**What to add to `scripts/coco/podvm/script-disk-mods-s390x.sh`** (inside the `if [ "$ARCH" = "s390x" ]` block, after the `parse-root.sh` patch write-out and before the `dracut` call):
+**What was changed in `scripts/verity/verity-s390x.sh`** (Bug #27 fix — already applied):
+BLS entries now include `rd.driver.pre=overlay` (for production boots via bootmap).
 
-```bash
-# Bug #25 fix: override systemd-volatile-root.service to use 'overlay' mode.
-# The stock service passes 'yes' (VOLATILE_YES) which uses MS_MOVE; that fails
-# on shared initrd mounts.  'overlay' (VOLATILE_OVERLAY) uses overlayfs instead.
-# Dracut bakes /etc/systemd/system/ drop-ins into the initramfs automatically.
-mkdir -p /etc/systemd/system/systemd-volatile-root.service.d
-cat > /etc/systemd/system/systemd-volatile-root.service.d/s390x-overlay.conf << 'EOF'
-[Service]
-ExecStart=
-ExecStart=/usr/lib/systemd/systemd-volatile-root overlay /sysroot
-EOF
-```
+**The boot command must also carry it** — `virt-install --boot kernel_args=` overrides the BLS cmdline entirely, so `rd.driver.pre=overlay` must be present in `kernel_args` too.
 
 **Pre-flight before rebuild:**
 ```bash
@@ -475,21 +500,21 @@ echo "PID: $!"
 tail -f /tmp/coco-verity-build.log
 ```
 
-**After rebuild — boot test:**
+**Boot test command (use this exact form):**
 ```bash
-# Use the new roothash printed at end of pipeline
-ROOTHASH=<new roothash from rebuild>
+# Always read roothash from sidecar — never copy manually
+ROOTHASH=$(cat /home/linuxuser/rafsal/new_build/output/rhel10-s390x-base.qcow2.roothash)
+
 sudo virsh destroy podvm-verity-test 2>/dev/null || true
 sudo virt-install \
   --name podvm-verity-test \
+  --osinfo detect=on,require=off \
   --memory 2048 --vcpus 2 \
-  --disk path=/home/linuxuser/suprit/new_build/output/rhel10-s390x-base.qcow2,format=qcow2,readonly=on \
-  --boot kernel=/tmp/vmlinuz-6.12.0-211.53.1.el10_2.s390x,initrd=/tmp/initramfs-6.12.0-211.53.1.el10_2.s390x.img \
-  --extra-args "root=/dev/mapper/root roothash=${ROOTHASH} systemd.verity_root_data=/dev/vda2 systemd.verity_root_hash=/dev/vda3 systemd.volatile=overlay console=ttysclp0 ro panic=30" \
-  --serial file,path=/tmp/podvm-boot-session7.log \
-  --graphics none --transient --noautoconsole
-sleep 60
-grep -E "login:|multi-user|kata-agent|emergency" /tmp/podvm-boot-session7.log | tail -20
+  --disk path=/home/linuxuser/rafsal/new_build/output/rhel10-s390x-base.qcow2,format=qcow2,readonly=on \
+  --boot kernel=/tmp/vmlinuz-6.12.0-211.53.1.el10_2.s390x,initrd=/tmp/initramfs-6.12.0-211.53.1.el10_2.s390x.img,kernel_args="root=/dev/mapper/root roothash=${ROOTHASH} systemd.verity_root_data=/dev/vda2 systemd.verity_root_hash=/dev/vda3 systemd.volatile=overlay rd.driver.pre=overlay console=ttysclp0 ro rd.shell rd.debug panic=0" \
+  --console pty,target_type=sclp \
+  --graphics none \
+  --transient
 ```
 
 **Expected success indicators:**

@@ -107,10 +107,16 @@ function get_input_img_format()
     export DISK_FORMAT
 }
 
-function handle_ctrlc()
+function handle_exit()
 {
+    local rc=$?
+    # Clean up the temp work directory whether the script exits cleanly,
+    # is interrupted (Ctrl-C), or fails mid-run (set -e triggers EXIT).
+    if [[ -n "$WORK_FOLDER" && -d "$WORK_FOLDER" ]]; then
+        rm -rf "$WORK_FOLDER"
+    fi
     cd "$here"
-    exit 0
+    exit $rc
 }
 
 WORK_FOLDER=${WORK_FOLDER:-$(mktemp -d)}
@@ -120,8 +126,8 @@ print_params
 
 cd "$WORK_FOLDER"
 
-trap handle_ctrlc SIGINT
-trap handle_ctrlc EXIT
+trap handle_exit SIGINT
+trap handle_exit EXIT
 
 get_input_img_format "$INPUT_IMAGE"
 
@@ -146,7 +152,6 @@ export ROOT_PARTITION_UUID
 echo ""
 
 cd - > /dev/null
-rm -rf "$WORK_FOLDER"
 
 echo "Process completed!"
 echo "Your s390x disk image now has CoCo components and dm-verity enabled."

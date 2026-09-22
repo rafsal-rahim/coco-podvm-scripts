@@ -209,6 +209,18 @@ function create_verity_partition()
     local WORKDIR="$VERITY_FOLDER/conf"
     mkdir -p "$WORKDIR"
 
+    # Query the actual root partition size in bytes so root.conf carries a
+    # tight SizeMaxBytes rather than the whole-disk size (current_size).
+    # lsblk --bytes avoids human-readable rounding; ROOT_PN is set by find_root_part().
+    local root_part_bytes
+    root_part_bytes=$(lsblk --bytes -o NAME,SIZE -r "$NBD_DEVICE" \
+        | grep "^${ROOT_PN} " | awk '{print $2}')
+    if [[ -z "$root_part_bytes" ]]; then
+        echo "Warning: could not determine root partition size; falling back to disk size." >&2
+        root_part_bytes=$current_size
+    fi
+    echo "Root partition size: $root_part_bytes bytes"
+
     cat > "$WORKDIR/verity.conf" <<EOF
 [Partition]
 Type=root-s390-verity
@@ -224,7 +236,7 @@ EOF
 Type=root-s390
 Verity=data
 VerityMatchKey=root
-SizeMaxBytes=${current_size}
+SizeMaxBytes=${root_part_bytes}
 EOF
 
     echo "Running systemd-repart to create verity hash partition ..."
@@ -351,6 +363,19 @@ function patch_bls_and_run_zipl()
             sed -i "/^options / s/$/ systemd.volatile=overlay/" "$entry"
         fi
 
+        # 5. Ensure rd.driver.pre=overlay is present.
+        #    systemd-volatile-root.service (VOLATILE_OVERLAY / make_overlay) calls
+        #    mount("overlay",...) — this fails with ENODEV if the overlay kernel
+        #    module is not loaded. rd.driver.pre=overlay causes dracut's pre-udev
+        #    hook to run modprobe overlay before any systemd unit starts, which is
+        #    the earliest possible point and guaranteed to precede the service.
+        #    All initramfs-side approaches (force_drivers, --add-drivers, --install,
+        #    modules-load.d) have failed to guarantee ordering on this dracut-107
+        #    build — the cmdline arg is the only reliable mechanism.
+        if ! grep -q "rd\.driver\.pre=overlay" "$entry"; then
+            sed -i "/^options / s/$/ rd.driver.pre=overlay/" "$entry"
+        fi
+
         # NOTE: roothash= is intentionally NOT added here.
         # See function header for the explanation.
 
@@ -465,7 +490,30 @@ mkdir -p mnt
 
 echo ""
 echo "Connecting disk via NBD ..."
-modprobe nbd
+modprobe nbd max_part=16 2>/dev/null || true
+# Wait for udev to create /dev/nbd* nodes after module load.
+# modprobe is synchronous for the module itself but udev device-node creation
+# is asynchronous — without this settle the nodes may not exist yet.
+udevadm settle
+sleep 1
+# If /dev/nbd* nodes are missing (same destruction vector as Bug #18 — a previous
+# run's rm -rf /tmp/tmp.* wiped host device nodes that were bind-mounted inside
+# a chroot/tmpdir), recreate them automatically.
+# NBD major number is always 43; minor = device_index * 16.
+if [[ ! -b "$NBD_DEVICE" ]]; then
+    echo "  $NBD_DEVICE missing — recreating /dev/nbd* nodes (major=43) ..."
+    for _i in $(seq 0 15); do
+        [[ ! -b "/dev/nbd${_i}" ]] && mknod "/dev/nbd${_i}" b 43 $((_i * 16)) && chmod 660 "/dev/nbd${_i}"
+    done
+    udevadm settle
+    sleep 1
+fi
+# Hard stop if the node is still absent — something deeper is wrong.
+if [[ ! -b "$NBD_DEVICE" ]]; then
+    echo "Error: $NBD_DEVICE still does not exist after node recreation." >&2
+    echo "  lsmod | grep nbd: $(lsmod | grep nbd || echo 'not loaded')" >&2
+    exit 1
+fi
 qemu-nbd -c "$NBD_DEVICE" -f "$DISK_FORMAT" "$DISK"
 nbd_mounted=1
 udevadm settle
@@ -503,6 +551,12 @@ if [[ "$APPLY_VERITY" == "true" ]]; then
     echo "Step 5 — computing dm-verity roothash (last disk operation) ..."
     compute_roothash
 
+    # Write the roothash to a sidecar file alongside the image so it is
+    # always recoverable without re-running veritysetup dump.
+    _rh_file="${DISK}.roothash"
+    echo "$RH" > "$_rh_file"
+    echo "Root hash saved to: $_rh_file"
+
     echo ""
     echo "================================================================"
     echo "dm-verity applied successfully."
@@ -524,10 +578,7 @@ if [[ "$APPLY_VERITY" == "true" ]]; then
     nbd_mounted=0
 fi
 
-# Cleanup
-echo ""
-echo "Disconnecting NBD device ..."
-qemu-nbd --disconnect "$NBD_DEVICE" 2>/dev/null || true
-nbd_mounted=0
+# Cleanup: rm the mnt directory; NBD disconnect is handled by handle_cleanup()
+# (called by the EXIT trap) so there is no need to disconnect here.
 rm -rf mnt
 cd "$here"

@@ -71,9 +71,27 @@ PARSE_ROOT=/usr/lib/dracut/modules.d/98dracut-systemd/parse-root.sh
 
 if [[ -f "$PARSE_ROOT" ]]; then
     cp -p "$PARSE_ROOT" "${PARSE_ROOT}.orig"
+
+    # Verify the exact pattern exists before patching so we fail loudly if
+    # dracut has changed parse-root.sh in a future RHEL 10 update rather than
+    # silently producing an un-patched initramfs (which causes the
+    # dracut-initqueue deadlock at boot: /dev/mapper/root never appears).
+    if ! grep -qF 'grep -q After=remote-fs-pre.target /run/systemd/generator/systemd-cryptsetup@*.service 2>/dev/null' "$PARSE_ROOT"; then
+        echo "ERROR: parse-root.sh does not contain the expected cryptsetup pattern." >&2
+        echo "       The dracut version on this image may have changed." >&2
+        echo "       Inspect $PARSE_ROOT and update the sed pattern in this script." >&2
+        exit 1
+    fi
+
     sed -i \
         's|grep -q After=remote-fs-pre\.target /run/systemd/generator/systemd-cryptsetup@\*\.service 2>/dev/null|& \&\& ! grep -q After=remote-fs-pre.target /run/systemd/generator/systemd-veritysetup@*.service 2>/dev/null|' \
         "$PARSE_ROOT"
+
+    # Confirm the patch actually landed.
+    if ! grep -q 'systemd-veritysetup' "$PARSE_ROOT"; then
+        echo "ERROR: sed ran without error but veritysetup bypass is absent from $PARSE_ROOT." >&2
+        exit 1
+    fi
     echo "parse-root.sh patched:"
     grep "veritysetup\|cryptsetup" "$PARSE_ROOT" || true
 fi
@@ -102,9 +120,64 @@ fi
 VOLATILE_SVC=/usr/lib/systemd/system/systemd-volatile-root.service
 
 cp -p "$VOLATILE_SVC" "${VOLATILE_SVC}.orig"
-sed -i 's|ExecStart=/usr/lib/systemd/systemd-volatile-root yes |ExecStart=/usr/lib/systemd/systemd-volatile-root overlay |' \
-    "$VOLATILE_SVC"
+
+# Pre-flight: confirm the "yes" argument exists before patching.
+# The stock unit may have "yes" at end-of-line (no trailing space), so the
+# sed pattern must NOT require a trailing space after "yes".
+if ! grep -qF 'systemd-volatile-root yes' "$VOLATILE_SVC"; then
+    echo "ERROR: systemd-volatile-root.service does not contain the expected 'yes' argument." >&2
+    echo "       Inspect $VOLATILE_SVC and update the sed pattern in this script." >&2
+    exit 1
+fi
+
+# Replace "yes" with "overlay" regardless of whether "yes" is followed by
+# a space, a newline, or additional arguments.
+sed -i 's|systemd-volatile-root yes[[:space:]]*|systemd-volatile-root overlay |g' "$VOLATILE_SVC"
+
+# Post-flight: confirm the patch landed.
+if grep -q 'systemd-volatile-root yes' "$VOLATILE_SVC"; then
+    echo "ERROR: sed ran but 'yes' is still present in systemd-volatile-root.service." >&2
+    exit 1
+fi
 echo "systemd-volatile-root.service patched:"
+grep "ExecStart" "$VOLATILE_SVC"
+
+# Ensure the overlay kernel module is loaded before systemd-volatile-root runs.
+#
+# History of failed approaches:
+#   - force_drivers in /etc/dracut.conf.d: only forces .ko into cpio, does not
+#     change load ordering — systemd-modules-load.service races the service.
+#   - --add-drivers + --install of modules-load.d conf: same race.
+#   - Neither approach produced 00-load-overlay.sh in the initramfs pre-mount
+#     hook dir (confirmed from boot log: only 99-mount-virtiofs.sh present).
+#
+# Correct fix: wrap the ExecStart in a shell one-liner that runs modprobe before
+# invoking the real binary. The wrapper runs inside the same service unit so
+# ordering is guaranteed — no race possible.
+#
+# The wrapper is installed into /usr/lib/systemd/ (alongside the binary) and
+# the service unit's ExecStart is patched to call the wrapper instead.
+# Both the wrapper and the patched unit are restored after dracut.
+
+WRAPPER=/usr/lib/systemd/systemd-volatile-root-s390x
+cat > "$WRAPPER" << 'EOF'
+#!/bin/bash
+# Load the overlay module required by VOLATILE_OVERLAY / make_overlay().
+# Without this, mount("overlay",...) returns ENODEV and the service exits 1.
+modprobe overlay 2>/dev/null || true
+exec /usr/lib/systemd/systemd-volatile-root overlay /sysroot
+EOF
+chmod +x "$WRAPPER"
+
+# Patch the service unit to call the wrapper (unit is already backed up above).
+sed -i 's|ExecStart=/usr/lib/systemd/systemd-volatile-root overlay /sysroot|ExecStart=/usr/lib/systemd/systemd-volatile-root-s390x|g' "$VOLATILE_SVC"
+
+# Confirm the patch landed.
+if ! grep -q 'systemd-volatile-root-s390x' "$VOLATILE_SVC"; then
+    echo "ERROR: wrapper patch did not land in $VOLATILE_SVC" >&2
+    exit 1
+fi
+echo "systemd-volatile-root.service patched to use wrapper:"
 grep "ExecStart" "$VOLATILE_SVC"
 
 # Also write a persistent drop-in for the real root (post-pivot_root boots)
@@ -115,7 +188,13 @@ ExecStart=
 ExecStart=/usr/lib/systemd/systemd-volatile-root overlay /sysroot
 EOF
 
-dracut --force --kver "${KERNEL_VERSION}.s390x" --add "systemd-veritysetup" --add-drivers "overlay"
+dracut --force --kver "${KERNEL_VERSION}.s390x" \
+    --add "systemd-veritysetup" \
+    --add-drivers "overlay" \
+    --install "$WRAPPER"
+
+# Restore: remove wrapper from host (it only belongs in the initramfs)
+rm -f "$WRAPPER"
 
 # Restore the original service unit so the installed system is unchanged
 mv "${VOLATILE_SVC}.orig" "$VOLATILE_SVC"
