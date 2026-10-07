@@ -4,6 +4,22 @@ set -e
 # Orchestrator for building a CoCo PodVM disk image on s390x.
 # Mirrors create-verity-podvm.sh but wires up the s390x-specific
 # coco-components and verity scripts.
+#
+# Cross-architecture (x86 host) support:
+#   On a non-s390x host this script automatically exports LIBGUESTFS_HV and
+#   LIBGUESTFS_BACKEND so that every virt-customize call in the sub-scripts
+#   (coco-components-s390x.sh, verity-s390x.sh) launches an s390x libguestfs
+#   appliance VM instead of the default x86_64 appliance.
+#
+#   Why LIBGUESTFS_HV is required on x86:
+#     virt-customize runs commands (zipl, dracut, dnf, etc.) inside a tiny
+#     "appliance" VM managed by libguestfs. Without LIBGUESTFS_HV the appliance
+#     is x86_64 and cannot execute s390x ELF binaries — the x86_64 kernel returns
+#     ENOEXEC. Setting LIBGUESTFS_HV=/usr/bin/qemu-system-s390x makes libguestfs
+#     boot an s390x appliance instead; the qcow2 is attached as /dev/vda
+#     (virtio-blk) which also satisfies zipl's block ioctl requirements.
+#
+#   See docs/s390x-build-on-x86/README.md for the full cross-build guide.
 
 INPUT_IMAGE=$1
 
@@ -41,6 +57,12 @@ function local_help()
     echo "PAUSE_BUNDLE_LOCATION:  optional  - path inside container for pause bundle"
     echo "ROOT_PASSWORD:          optional  - set root password. Default: disabled"
     echo ""
+    echo "Cross-architecture:"
+    echo "  On s390x: runs natively (libguestfs uses the default KVM appliance)."
+    echo "  On x86_64: automatically sets LIBGUESTFS_HV=qemu-system-s390x so"
+    echo "  virt-customize boots an s390x appliance for zipl/dracut/dnf."
+    echo "  Requires: qemu-system-s390x installed on the x86 host."
+    echo ""
     echo "Exiting"
 }
 
@@ -61,6 +83,41 @@ VERITY_SCRIPT_LOCATION=$(realpath "$VERITY_SCRIPT_LOCATION")
 
 COCO_SCRIPT_LOCATION=${COCO_SCRIPT_LOCATION:-"$SCRIPT_FOLDER/coco/coco-components-s390x.sh"}
 COCO_SCRIPT_LOCATION=$(realpath "$COCO_SCRIPT_LOCATION")
+
+# ── Cross-architecture libguestfs configuration ───────────────────────────────
+# When running on a non-s390x host, configure libguestfs to use qemu-system-s390x
+# as the appliance hypervisor so that virt-customize can execute s390x binaries
+# (zipl, dracut, dnf) inside the s390x appliance VM.
+#
+# LIBGUESTFS_HV     — overrides the hypervisor binary used to boot the appliance.
+#                     On x86: /usr/bin/qemu-system-s390x  (software emulation)
+#                     On s390x: left unset (libguestfs default = KVM appliance)
+#
+# LIBGUESTFS_BACKEND — "direct" bypasses the libvirt daemon.  Required when
+#                     running inside a container (no libvirtd) and recommended
+#                     for host builds where libvirtd permission/socket issues
+#                     would otherwise block appliance launch.
+HOST_ARCH=$(uname -m)
+if [[ "$HOST_ARCH" != "s390x" ]]; then
+    QEMU_S390X=$(command -v qemu-system-s390x 2>/dev/null || true)
+    if [[ -z "$QEMU_S390X" ]]; then
+        echo "ERROR: qemu-system-s390x not found on PATH." >&2
+        echo "  Install it first:" >&2
+        echo "    Fedora/RHEL: sudo dnf install qemu-system-s390x" >&2
+        echo "    Ubuntu:      sudo apt install qemu-system-misc" >&2
+        echo "  See docs/s390x-build-on-x86/README.md for the full guide." >&2
+        exit 1
+    fi
+    export LIBGUESTFS_HV="$QEMU_S390X"
+    export LIBGUESTFS_BACKEND=direct
+    echo "Cross-arch mode: host=$HOST_ARCH — LIBGUESTFS_HV=$LIBGUESTFS_HV"
+    echo "  All virt-customize calls will use the s390x appliance (software emulation)."
+else
+    # On s390x: honour any pre-existing LIBGUESTFS_BACKEND (e.g. set by
+    # Dockerfile.s390x), but do not override LIBGUESTFS_HV.
+    export LIBGUESTFS_BACKEND=${LIBGUESTFS_BACKEND:-direct}
+    echo "Native s390x mode: using KVM-accelerated libguestfs appliance."
+fi
 
 function print_params()
 {

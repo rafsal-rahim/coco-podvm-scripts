@@ -86,8 +86,15 @@ SM_REGISTER=()
 [[ -n "${ACTIVATION_KEY}" && -n "${ORG_ID}" ]] && \
     SM_REGISTER=(--run-command "subscription-manager register --org=${ORG_ID} --activationkey=${ACTIVATION_KEY}")
 
-# virt-customize on s390x: the appliance is built for the host arch so this
-# must run on an s390x host (or an s390x KVM guest used as a build machine).
+# virt-customize: LIBGUESTFS_HV and LIBGUESTFS_BACKEND are inherited from the
+# environment set by the orchestrator (create-verity-podvm-s390x.sh).
+#
+# On s390x hosts:     LIBGUESTFS_HV is unset → libguestfs uses the default
+#                     KVM-accelerated s390x appliance.
+# On x86_64 hosts:    LIBGUESTFS_HV=/usr/bin/qemu-system-s390x is exported by
+#                     create-verity-podvm-s390x.sh → libguestfs boots an s390x
+#                     appliance under software emulation so that zipl, dracut,
+#                     and all s390x binaries execute correctly inside the guest.
 #
 # Note: --upload is used instead of --copy-in for the payload tarballs.
 # --copy-in wraps files in a host-side tar stream before sending via the
