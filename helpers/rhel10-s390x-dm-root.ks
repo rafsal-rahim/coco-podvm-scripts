@@ -6,7 +6,9 @@
 #version=RHEL10
 text
 
-repo --name="AppStream" --baseurl=file:///run/install/sources/mount-0000-cdrom/AppStream
+# No explicit repo directive: Anaconda automatically exposes both BaseOS and
+# AppStream from the mounted ISO when inst.repo=hd:/dev/vdb: is on the cmdline.
+# An explicit repo --baseurl= line is only needed for supplementary repos.
 
 %addon com_redhat_kdump --disable
 %end
@@ -15,7 +17,8 @@ keyboard --vckeymap=us --xlayouts='us'
 lang en_US.UTF-8
 network --bootproto=dhcp --hostname=localhost.localdomain
 firewall --disabled
-cdrom
+# No install-source directive: the source is set by inst.repo= on the kernel
+# cmdline (see helpers/build-s390x-base-image.sh).
 
 # Root password — cleared by waagent deprovision at end of %post
 rootpw --allow-ssh redhat123

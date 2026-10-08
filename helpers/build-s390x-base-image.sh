@@ -103,63 +103,44 @@ mkdir -p "$OUTPUT_DIR"
 # Remove leftover disk from a previous failed attempt
 rm -f "$OUTPUT_DISK"
 
-# ── Expose ISO as a directory for virt-install --location ─────────────────────
-# virt-install --location requires a directory (install tree root), not a bare
-# .iso file path.
+# ── Expose ISO to virt-install via loop mount ─────────────────────────────────
+# virt-install --location requires a directory (install tree root).
+# We use an explicit losetup -f to find a free loop device and mount read-only.
 #
-# Strategy (tried in order):
-#   1. loop mount        — fastest, zero disk copy; needs a free loop device
-#   2. python3 pycdlib    — pure-python ISO 9660 extraction; python3 always present on RHEL 10
-#   3. bsdtar / 7z       — if present
+# The ISO also needs to be attached as a second virtio disk so the guest can
+# reach images/install.img (the stage2 squashfs).  QEMU runs as uid:107
+# (qemu user) and cannot access paths under /root — copy the ISO into
+# /var/lib/libvirt/images/ which is already qemu-accessible.
+# We bind-mount (read-only) to avoid duplicating 8 GB on disk.
+ISO_LIBVIRT_LINK="/var/lib/libvirt/images/rhel10-s390x-install.iso"
+if [[ ! -f "$ISO_LIBVIRT_LINK" ]]; then
+    echo "Bind-mounting ISO for QEMU access ..."
+    touch "$ISO_LIBVIRT_LINK"
+    mount --bind "$ISO_PATH" "$ISO_LIBVIRT_LINK"
+    echo "  → bind-mounted $ISO_PATH at $ISO_LIBVIRT_LINK"
+fi
+
 ISO_MOUNT=$(mktemp -d /tmp/rhel10-s390x-iso-mount.XXXXXX)
 ISO_MOUNTED=0
 
-echo "Preparing install tree from ISO ..."
-# Ensure the loop module is loaded before attempting a loop mount
+echo "Mounting ISO ..."
 modprobe loop 2>/dev/null || true
-if mount -o loop,ro "$ISO_PATH" "$ISO_MOUNT" 2>/dev/null; then
-    echo "  → loop-mounted at $ISO_MOUNT"
-    ISO_MOUNTED=1
-elif command -v bsdtar &>/dev/null; then
-    echo "  → extracting with bsdtar (may take a minute) ..."
-    bsdtar -xf "$ISO_PATH" -C "$ISO_MOUNT"
-elif command -v 7z &>/dev/null; then
-    echo "  → extracting with 7z (may take a minute) ..."
-    7z x "$ISO_PATH" -o"$ISO_MOUNT" -y -bd > /dev/null
-elif python3 -c "import pycdlib" 2>/dev/null; then
-    echo "  → extracting with python3 pycdlib (may take a minute) ..."
-    python3 - "$ISO_PATH" "$ISO_MOUNT" <<'PYEOF'
-import sys, os, pycdlib
-iso = pycdlib.PyCdlib()
-iso.open(sys.argv[1])
-for dirpath, dirlist, filelist in iso.walk(rr_path='/'):
-    tgt_dir = os.path.join(sys.argv[2], dirpath.lstrip('/'))
-    os.makedirs(tgt_dir, exist_ok=True)
-    for fname in filelist:
-        rr = os.path.join(dirpath, fname)
-        out = os.path.join(tgt_dir, fname)
-        with iso.open_file_from_iso(rr_path=rr) as f, open(out, 'wb') as g:
-            g.write(f.read())
-iso.close()
-PYEOF
-else
-    echo "  → no extraction tool found; attempting dnf install of genisoimage ..."
-    if dnf install -y genisoimage &>/dev/null && command -v isoinfo &>/dev/null; then
-        echo "  → extracting with isoinfo ..."
-        # Use isoinfo to enumerate and extract every file from the ISO
-        isoinfo -f -R -i "$ISO_PATH" | while IFS= read -r isofile; do
-            tgt="$ISO_MOUNT/${isofile#/}"
-            mkdir -p "$(dirname "$tgt")"
-            isoinfo -R -i "$ISO_PATH" -x "$isofile" > "$tgt" 2>/dev/null || true
-        done
-    else
-        echo "ERROR: Cannot prepare install tree." >&2
-        echo "  Loop mount failed and no extraction tool is available (bsdtar, 7z, pycdlib, isoinfo)." >&2
-        echo "  Run: sudo dnf install -y genisoimage" >&2
-        rm -rf "$ISO_MOUNT"; exit 1
-    fi
+LODEV=$(losetup -f 2>/dev/null || true)
+if [[ -z "$LODEV" ]]; then
+    echo "ERROR: No free loop device available." >&2
+    echo "  Check: losetup -a" >&2
+    rm -rf "$ISO_MOUNT"; exit 1
 fi
-LOCATION="$ISO_MOUNT"
+losetup -r "$LODEV" "$ISO_PATH"
+if mount -o ro "$LODEV" "$ISO_MOUNT"; then
+    echo "  → loop-mounted $ISO_PATH at $ISO_MOUNT (via $LODEV)"
+    ISO_MOUNTED=1
+    LOCATION="$ISO_MOUNT"
+else
+    losetup -d "$LODEV" 2>/dev/null || true
+    echo "ERROR: Failed to mount ISO at $ISO_PATH" >&2
+    rm -rf "$ISO_MOUNT"; exit 1
+fi
 
 # ── Cleanup handler ───────────────────────────────────────────────────────────
 function cleanup()
@@ -171,12 +152,17 @@ function cleanup()
         echo "Destroying transient VM $VM_NAME ..."
         virsh destroy "$VM_NAME" 2>/dev/null || true
     fi
-    # Unmount or remove the install tree temp dir
+    # Unmount and detach loop device for the install tree temp dir
     if [[ "$ISO_MOUNTED" -eq 1 ]] && mountpoint -q "$ISO_MOUNT" 2>/dev/null; then
         echo "Unmounting ISO at $ISO_MOUNT ..."
         umount "$ISO_MOUNT" 2>/dev/null || true
+        [[ -n "${LODEV:-}" ]] && losetup -d "$LODEV" 2>/dev/null || true
     fi
-    rm -rf "$ISO_MOUNT"
+    [[ -n "$ISO_MOUNT" ]] && rm -rf "$ISO_MOUNT"
+    if mountpoint -q "$ISO_LIBVIRT_LINK" 2>/dev/null; then
+        umount "$ISO_LIBVIRT_LINK" 2>/dev/null || true
+    fi
+    rm -f "$ISO_LIBVIRT_LINK"
     if [[ $rc -ne 0 ]]; then
         echo "Build FAILED (exit code $rc)." >&2
     fi
@@ -206,7 +192,7 @@ else
         exit 1
     fi
     VIRT_TYPE="qemu"
-    VIRT_TYPE_ARGS=(--virt-type qemu --emulator "$QEMU_S390X")
+    VIRT_TYPE_ARGS=(--virt-type qemu --boot "emulator=${QEMU_S390X}")
     echo "Host arch: $HOST_ARCH — using QEMU software emulation ($QEMU_S390X)"
     echo "NOTE: Software emulation is ~5-10x slower than native KVM."
     echo "      Expected build time: 1-3 hours. Output is identical to KVM."
@@ -222,20 +208,32 @@ fi
 # inst.ks.org_id= and inst.ks.activation_key= — Anaconda preserves all
 # inst.ks.* parameters and makes the full cmdline available in /proc/cmdline
 # inside the %post environment so the kickstart can read them with sed.
+#
+# The ISO is attached to the guest as a second virtio-blk disk (vdb):
+#   - virt-install --location only extracts kernel+initrd and injects no
+#     inst.repo/inst.stage2; the stage2 squashfs (images/install.img) lives
+#     on the ISO and must be reachable by the guest at boot time.
+#   - inst.repo=hd:/dev/vdb: names the device explicitly.  Bare
+#     inst.repo=cdrom/hd: leaves "root" unset in dracut's
+#     27-parse-anaconda-repo.sh and falls back to polling /sys/block/sr*,
+#     which a virtio-blk disk never matches.
+# The loop mount ($LOCATION) is still used so virt-install can extract
+# kernel.img + initrd.img.
 
 virt-install \
     "${VIRT_TYPE_ARGS[@]}" \
-    --os-variant rhel10.2 \
+    --osinfo detect=on,require=off \
     --arch s390x \
     --name "$VM_NAME" \
     --memory "$VM_MEMORY_MB" \
     --location "$LOCATION" \
     --disk "path=${OUTPUT_DISK},format=qcow2,bus=virtio,size=${DISK_SIZE_GB}" \
+    --disk "path=${ISO_LIBVIRT_LINK},device=disk,format=raw,bus=virtio,readonly=on" \
     --initrd-inject "$KS_FILE" \
     --nographics \
     --noautoconsole \
     --wait -1 \
-    --extra-args "console=ttysclp0 inst.ks=file:/rhel10-s390x-dm-root.ks inst.ks.org_id=${ORG_ID} inst.ks.activation_key=${ACTIVATION_KEY}" \
+    --extra-args "console=ttysclp0 inst.repo=hd:/dev/vdb: inst.ks=file:/rhel10-s390x-dm-root.ks inst.ks.org_id=${ORG_ID} inst.ks.activation_key=${ACTIVATION_KEY}" \
     --transient
 
 echo ""
