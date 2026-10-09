@@ -90,7 +90,12 @@ COCO_SCRIPT_LOCATION=$(realpath "$COCO_SCRIPT_LOCATION")
 # (zipl, dracut, dnf) inside the s390x appliance VM.
 #
 # LIBGUESTFS_HV     — overrides the hypervisor binary used to boot the appliance.
-#                     On x86: /usr/bin/qemu-system-s390x  (software emulation)
+#                     On x86: a wrapper script that rewrites x86-only QEMU args
+#                     to s390x equivalents before exec-ing qemu-system-s390x.
+#                     libguestfs hardcodes -machine q35 (x86-only); s390x needs
+#                     -machine s390-ccw-virtio. Setting LIBGUESTFS_HV to the
+#                     wrapper lets libguestfs build its cmdline normally, and the
+#                     wrapper performs the substitution transparently.
 #                     On s390x: left unset (libguestfs default = KVM appliance)
 #
 # LIBGUESTFS_BACKEND — "direct" bypasses the libvirt daemon.  Required when
@@ -108,9 +113,37 @@ if [[ "$HOST_ARCH" != "s390x" ]]; then
         echo "  See docs/s390x-build-on-x86/README.md for the full guide." >&2
         exit 1
     fi
-    export LIBGUESTFS_HV="$QEMU_S390X"
+    # libguestfs generates an x86-centric QEMU cmdline including -machine q35
+    # which qemu-system-s390x rejects with "unsupported machine type".
+    # Write a wrapper that replaces -machine and -cpu with s390x equivalents
+    # and drops x86-only flags (-global kvm-pit.*) before exec-ing the binary.
+    LIBGUESTFS_HV_WRAPPER="/usr/local/bin/qemu-s390x-libguestfs-wrapper"
+    cat > "$LIBGUESTFS_HV_WRAPPER" << 'WRAPPER_EOF'
+#!/bin/bash
+# Auto-generated wrapper: rewrites libguestfs x86 machine args for qemu-system-s390x.
+args=()
+skip_next=0
+for arg in "$@"; do
+    if [[ $skip_next -eq 1 ]]; then
+        skip_next=0
+        continue
+    fi
+    case "$arg" in
+        -machine) args+=("-machine" "s390-ccw-virtio"); skip_next=1 ;;
+        -cpu)     args+=("-cpu" "max");                 skip_next=1 ;;
+        -global)  skip_next=1 ;;  # drop -global kvm-pit.lost_tick_policy=discard
+        *)        args+=("$arg") ;;
+    esac
+done
+exec QEMU_S390X_PLACEHOLDER "${args[@]}"
+WRAPPER_EOF
+    # Inject the real qemu path (can contain spaces/special chars in path)
+    sed -i "s|QEMU_S390X_PLACEHOLDER|${QEMU_S390X}|" "$LIBGUESTFS_HV_WRAPPER"
+    chmod +x "$LIBGUESTFS_HV_WRAPPER"
+    export LIBGUESTFS_HV="$LIBGUESTFS_HV_WRAPPER"
     export LIBGUESTFS_BACKEND=direct
     echo "Cross-arch mode: host=$HOST_ARCH — LIBGUESTFS_HV=$LIBGUESTFS_HV"
+    echo "  Wrapper rewrites -machine q35 → s390-ccw-virtio for qemu-system-s390x."
     echo "  All virt-customize calls will use the s390x appliance (software emulation)."
 else
     # On s390x: honour any pre-existing LIBGUESTFS_BACKEND (e.g. set by
