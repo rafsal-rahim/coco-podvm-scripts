@@ -383,37 +383,131 @@ function patch_bls_and_run_zipl()
         echo "  Result: $(grep '^options' "$entry")"
     done
 
-    root_mounted=0
-    umount "$VERITY_FOLDER/mnt"
     echo "BLS entries patched."
 
-    # Disconnect NBD before handing the disk to virt-customize.
-    echo "Disconnecting NBD for virt-customize zipl run ..."
+    # Write a systemd oneshot service into the guest image (via the still-mounted
+    # root partition) that runs zipl then poweroffs when the VM boots.
+    # This avoids any interactive shell — the VM boots normally via systemd,
+    # the oneshot fires after basic.target, zipl writes /boot/bootmap, and
+    # poweroff -f shuts the VM down cleanly so virt-install --wait -1 returns.
+    local zipl_svc="$VERITY_FOLDER/mnt/etc/systemd/system/zipl-bootmap-update.service"
+    cat > "$zipl_svc" <<'EOF'
+[Unit]
+Description=Update zipl bootmap and poweroff
+After=local-fs.target
+ConditionPathExists=!/run/zipl-done
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'touch /run/zipl-done && zipl --verbose && sync && poweroff -f'
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    ln -sf /etc/systemd/system/zipl-bootmap-update.service \
+        "$VERITY_FOLDER/mnt/etc/systemd/system/multi-user.target.wants/zipl-bootmap-update.service"
+
+    # Extract kernel + initrd for direct-boot (QEMU doesn't need the bootmap
+    # to exist yet — we extracted kernel/initrd from the live filesystem).
+    local kver
+    kver=$(ls "$VERITY_FOLDER/mnt/boot/vmlinuz-"* 2>/dev/null \
+        | sort -V | tail -1 | sed 's|.*/vmlinuz-||')
+    if [[ -z "$kver" ]]; then
+        echo "Error: could not find kernel in /boot of the guest image" >&2
+        exit 1
+    fi
+    echo "Kernel version for zipl VM boot: $kver"
+
+    # QEMU runs as uid:107 (qemu user) and cannot access paths under /root.
+    # Copy kernel + initrd into /var/lib/libvirt/images/ which is group-accessible
+    # to qemu. Bind-mount the disk there (read-write) to avoid duplicating GBs.
+    local LIBVIRT_IMAGES="/var/lib/libvirt/images"
+    local zipl_disk_link="${LIBVIRT_IMAGES}/zipl-run-$$.qcow2"
+    local zipl_kernel="${LIBVIRT_IMAGES}/zipl-kernel-$$"
+    local zipl_initrd="${LIBVIRT_IMAGES}/zipl-initrd-$$.img"
+
+    cp "$VERITY_FOLDER/mnt/boot/vmlinuz-${kver}" "$zipl_kernel"
+    cp "$VERITY_FOLDER/mnt/boot/initramfs-${kver}.img" "$zipl_initrd"
+    chmod 644 "$zipl_kernel" "$zipl_initrd"
+
+    root_mounted=0
+    umount "$VERITY_FOLDER/mnt"
+
+    # Bind-mount the disk so QEMU (uid:107) can open it read-write.
+    touch "$zipl_disk_link"
+    mount --bind "$DISK" "$zipl_disk_link"
+    chmod 660 "$zipl_disk_link"
+    chown root:qemu "$zipl_disk_link" 2>/dev/null || true
+
+    # Disconnect NBD before handing the disk to virt-install.
+    echo "Disconnecting NBD for virt-install zipl run ..."
     qemu-nbd --disconnect "$NBD_DEVICE"
     nbd_mounted=0
     udevadm settle
     sleep 2
 
-    # Run zipl inside the guest via virt-customize.
-    # This avoids all NBD block-level I/O issues — zipl runs against /dev/vda
-    # (the real virtio disk) inside a KVM guest, exactly as in Stage 2.
-    # After this step, /boot/bootmap contains the clean cmdline with
-    # root=/dev/mapper/root (without roothash=).
-    echo "Running zipl via virt-customize to update bootmap ..."
-    virt-customize \
-        -a "$DISK" \
-        --run-command 'zipl --verbose' \
-        --selinux-relabel
-    local vc_rc=$?
-    if [[ $vc_rc -ne 0 ]]; then
-        echo "Error: virt-customize zipl run failed (exit $vc_rc)" >&2
+    # Run zipl inside the guest via virt-install --import.
+    #
+    # The VM boots normally via its own kernel+initrd+systemd.
+    # zipl-bootmap-update.service fires after local-fs.target, runs
+    # zipl --verbose, then poweroffs. virt-install --wait -1 returns
+    # when the domain shuts off. No interactive shell, no stdin needed.
+    #
+    # root=/dev/vda2 is the raw partition — systemd-veritysetup-generator
+    # won't activate dm-verity because roothash= is not on the cmdline,
+    # so the partition mounts normally read-write and zipl can write bootmap.
+    local QEMU_S390X
+    QEMU_S390X=$(command -v qemu-system-s390x 2>/dev/null || true)
+    if [[ -z "$QEMU_S390X" ]]; then
+        echo "Error: qemu-system-s390x not found — required for zipl VM boot" >&2
         exit 1
     fi
-    echo "zipl updated via virt-customize."
+
+    local zipl_vm_name="zipl-run-$$"
+    echo "Running zipl via virt-install --import (qemu-system-s390x) ..."
+    echo "  VM boots, zipl-bootmap-update.service runs zipl then poweroffs."
+    echo "  This will take several minutes under software emulation ..."
+
+    virt-install \
+        --virt-type qemu \
+        --boot "emulator=${QEMU_S390X}" \
+        --osinfo detect=on,require=off \
+        --arch s390x \
+        --name "$zipl_vm_name" \
+        --memory 2048 \
+        --import \
+        --disk "path=${zipl_disk_link},format=${DISK_FORMAT},bus=virtio" \
+        --boot "kernel=${zipl_kernel},initrd=${zipl_initrd},kernel_args=console=ttysclp0 root=/dev/vda2 rw" \
+        --nographics \
+        --noautoconsole \
+        --wait -1 \
+        --transient 2>&1 || true
+
+    # Remove the oneshot service from the image — it must not persist into
+    # the final PodVM image (it would try to run zipl on every boot).
+    # Reconnect NBD briefly to clean up.
+    echo "Cleaning up zipl oneshot service from image ..."
+    if qemu-nbd -c "$NBD_DEVICE" -f "$DISK_FORMAT" "$DISK" 2>/dev/null; then
+        nbd_mounted=1
+        udevadm settle; sleep 2; partprobe "$NBD_DEVICE" 2>/dev/null || true
+        udevadm settle; sleep 1
+        mount "/dev/${ROOT_PN}" "$VERITY_FOLDER/mnt" && root_mounted=1
+        rm -f "$VERITY_FOLDER/mnt/etc/systemd/system/multi-user.target.wants/zipl-bootmap-update.service"
+        rm -f "$VERITY_FOLDER/mnt/etc/systemd/system/zipl-bootmap-update.service"
+        root_mounted=0; umount "$VERITY_FOLDER/mnt"
+        qemu-nbd --disconnect "$NBD_DEVICE"; nbd_mounted=0
+        udevadm settle; sleep 2
+    fi
+
+    # Unmount the bind-mount and clean up temp files.
+    umount "$zipl_disk_link" 2>/dev/null || true
+    rm -f "$zipl_disk_link" "$zipl_kernel" "$zipl_initrd"
+    echo "zipl VM run complete."
 
     # Reconnect NBD for the veritysetup format step.
     echo "Reconnecting NBD for veritysetup ..."
-    # Wait for virt-customize write lock to release (up to 30s)
     for _i in $(seq 1 15); do
         if qemu-nbd -c "$NBD_DEVICE" -f "$DISK_FORMAT" "$DISK" 2>/dev/null; then
             nbd_mounted=1
@@ -423,7 +517,7 @@ function patch_bls_and_run_zipl()
         sleep 2
     done
     if [[ $nbd_mounted -eq 0 ]]; then
-        echo "Error: could not reopen disk after zipl — write lock not released" >&2
+        echo "Error: could not reopen disk after zipl VM — write lock not released" >&2
         exit 1
     fi
     udevadm settle
@@ -446,6 +540,9 @@ function patch_bls_and_run_zipl()
 function compute_roothash()
 {
     echo "Running veritysetup format (final operation on vda2) ..."
+    # veritysetup is at /usr/sbin/veritysetup — add /usr/sbin to PATH explicitly
+    # in case this script is invoked via nohup/sudo with a stripped PATH.
+    export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
     RH=$(veritysetup format "$DATA_DEV" "$HASH_DEV" \
         | grep "^Root hash:" \
         | awk '{print $3}')
@@ -460,6 +557,16 @@ function compute_roothash()
 }
 
 # ── main ───────────────────────────────────────────────────────────────────
+
+# Pre-flight: verify required tools are present before touching the disk.
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+for _tool in qemu-nbd qemu-img veritysetup systemd-repart partprobe jq; do
+    if ! command -v "$_tool" &>/dev/null; then
+        echo "Error: required tool '$_tool' not found on PATH." >&2
+        echo "  Install it and retry. PATH=$PATH" >&2
+        exit 1
+    fi
+done
 
 print_params
 

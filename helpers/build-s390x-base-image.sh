@@ -233,7 +233,7 @@ virt-install \
     --nographics \
     --noautoconsole \
     --wait -1 \
-    --extra-args "console=ttysclp0 inst.repo=hd:/dev/vdb: inst.ks=file:/rhel10-s390x-dm-root.ks inst.ks.org_id=${ORG_ID} inst.ks.activation_key=${ACTIVATION_KEY}" \
+    --extra-args "console=ttysclp0 inst.repo=hd:/dev/vdb:/ inst.ks=file:/rhel10-s390x-dm-root.ks inst.ks.org_id=${ORG_ID} inst.ks.activation_key=${ACTIVATION_KEY}" \
     --transient
 
 echo ""
