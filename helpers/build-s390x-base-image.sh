@@ -170,6 +170,20 @@ function cleanup()
 }
 trap cleanup EXIT SIGINT SIGTERM
 
+# ── Identify the installer repo by ISO volume label ───────────────────────────
+# Do NOT name the ISO disk by kernel device (/dev/vdb): the guest assigns vdX
+# in virtio-blk probe order, which is not stable between boots.  When the order
+# flips, inst.repo=hd:/dev/vdb: points at the blank target disk and dracut
+# loops forever ("Can't find a SQUASHFS superblock on vdb").  The ISO volume
+# label is read from the loop device already attached above.
+ISO_LABEL=$(blkid -s LABEL -o value "$LODEV" 2>/dev/null || true)
+if [[ -z "$ISO_LABEL" ]]; then
+    echo "ERROR: could not read ISO volume label from $LODEV ($ISO_PATH)." >&2
+    echo "  Check: blkid $LODEV" >&2
+    exit 1
+fi
+echo "ISO volume label: $ISO_LABEL"
+
 # ── Detect host architecture and select virtualisation type ──────────────────
 # On a native s390x KVM host, use hardware-accelerated KVM.
 # On any other host (x86_64, aarch64, etc.) fall back to software emulation via
@@ -209,14 +223,16 @@ fi
 # inst.ks.* parameters and makes the full cmdline available in /proc/cmdline
 # inside the %post environment so the kickstart can read them with sed.
 #
-# The ISO is attached to the guest as a second virtio-blk disk (vdb):
+# The ISO is attached to the guest as a second virtio-blk disk (guest name not fixed):
 #   - virt-install --location only extracts kernel+initrd and injects no
 #     inst.repo/inst.stage2; the stage2 squashfs (images/install.img) lives
 #     on the ISO and must be reachable by the guest at boot time.
-#   - inst.repo=hd:/dev/vdb: names the device explicitly.  Bare
+#   - inst.repo=hd:LABEL=<iso label>:/ names the ISO by volume label.  A bare
 #     inst.repo=cdrom/hd: leaves "root" unset in dracut's
 #     27-parse-anaconda-repo.sh and falls back to polling /sys/block/sr*,
-#     which a virtio-blk disk never matches.
+#     which a virtio-blk disk never matches.  A kernel device name such as
+#     /dev/vdb must NOT be used: vda/vdb are assigned in probe order and can
+#     swap between boots (Bug 17).
 # The loop mount ($LOCATION) is still used so virt-install can extract
 # kernel.img + initrd.img.
 
@@ -233,7 +249,7 @@ virt-install \
     --nographics \
     --noautoconsole \
     --wait -1 \
-    --extra-args "console=ttysclp0 inst.repo=hd:/dev/vdb:/ inst.ks=file:/rhel10-s390x-dm-root.ks inst.ks.org_id=${ORG_ID} inst.ks.activation_key=${ACTIVATION_KEY}" \
+    --extra-args "console=ttysclp0 inst.repo=hd:LABEL=${ISO_LABEL}:/ inst.ks=file:/rhel10-s390x-dm-root.ks inst.ks.org_id=${ORG_ID} inst.ks.activation_key=${ACTIVATION_KEY}" \
     --transient
 
 echo ""

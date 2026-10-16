@@ -151,15 +151,15 @@ function find_root_part()
     ROOT_PN=$(lsblk -o NAME,PARTTYPE -r "$NBD_DEVICE" \
         | grep -i "$ROOT_PARTITION_UUID" | awk '{print $1}')
 
-    # Fallback: largest partition by size (root is always the largest)
+    # Fallback: root is partition 2 (vda1 = /boot-se, vda2 = root).
+    # Do NOT pick by size: since Bug 19, vda1 is a 128 MiB ext4 partition that
+    # could outrank a small verity hash partition and be mistaken for root.
     if [[ -z "$ROOT_PN" ]]; then
-        echo "  lsblk PARTTYPE empty — falling back to largest-partition heuristic ..."
-        ROOT_PN=$(lsblk -o NAME,SIZE -r "$NBD_DEVICE" \
+        echo "  lsblk PARTTYPE empty — falling back to partition number: p2 = root ..."
+        ROOT_PN=$(lsblk -o NAME -r "$NBD_DEVICE" \
             | tail -n +2 \
-            | grep -v "^${NBD_DEVICE#/dev/} " \
-            | sort -k2 -h \
-            | tail -1 \
-            | awk '{print $1}')
+            | grep -v "^${NBD_DEVICE#/dev/} $" \
+            | awk -v dev="${NBD_DEVICE#/dev/}" '$0 ~ dev "p?2$|" dev "2$" {print $1; exit}')
     fi
 
     if [[ -z "$ROOT_PN" ]]; then
@@ -252,24 +252,25 @@ EOF
     udevadm settle
     sleep 2
 
-    # Identify data and hash partitions by size (lsblk PARTTYPE is blank on NBD).
+    # Identify data and hash partitions by partition number (Bug 19):
+    #   p1 = /boot-se (plain 128 MiB), p2 = root data, p3 = verity hash.
+    # Do NOT pick by size: vda1 is 128 MiB and could outrank a small hash
+    # partition, which would point veritysetup at the wrong device.
     local _base="${NBD_DEVICE#/dev/}"
-    local _sorted
-    _sorted=$(lsblk -o NAME,SIZE -r "$NBD_DEVICE" \
-        | tail -n +2 \
-        | grep -v "^${_base} " \
-        | sort -k2 -rh)
-
     local _data_pn _hash_pn
-    _data_pn=$(echo "$_sorted" | awk 'NR==1{print $1}')
-    _hash_pn=$(echo "$_sorted" | awk 'NR==2{print $1}')
+    _data_pn=$(lsblk -o NAME -r "$NBD_DEVICE" \
+        | tail -n +2 | grep -v "^${_base} $" \
+        | awk -v dev="$_base" '$0 ~ dev "p?2$|" dev "2$" {print $1; exit}')
+    _hash_pn=$(lsblk -o NAME -r "$NBD_DEVICE" \
+        | tail -n +2 | grep -v "^${_base} $" \
+        | awk -v dev="$_base" '$0 ~ dev "p?3$|" dev "3$" {print $1; exit}')
 
     if [[ -z "$_data_pn" ]]; then
-        echo "Error: could not find root data partition on $NBD_DEVICE" >&2
+        echo "Error: could not find root data partition (p2) on $NBD_DEVICE" >&2
         exit 1
     fi
     if [[ -z "$_hash_pn" ]]; then
-        echo "Error: could not find verity hash partition on $NBD_DEVICE" >&2
+        echo "Error: could not find verity hash partition (p3) on $NBD_DEVICE" >&2
         echo "systemd-repart may not have created it — check output above." >&2
         exit 1
     fi

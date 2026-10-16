@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # build-se-podvm.sh — Package a dm-verity protected s390x PodVM into an IBM Secure Execution (.protvirt) image
-#                      or write it into the PReP boot partition (vda1) to produce a self-contained all-in-one QCOW2 image.
+#                      or copy it onto the ext4 /boot-se partition (vda1) to produce a self-contained all-in-one QCOW2 image.
 #
 # This script supports two operational modes:
 #
@@ -12,9 +12,12 @@
 #
 #   Mode 2 (All-in-One QCOW2 with --write-to-disk):
 #     - Generates the .protvirt image.
-#     - Writes the .protvirt image directly into the PReP boot partition (vda1) of the qcow2 image.
-#     - Configures the image so it boots standalone via standard disk boot (<boot dev='hd'/>)
-#       without modifying the root filesystem (vda2), preserving dm-verity integrity.
+#     - Copies the .protvirt as a regular file onto the ext4 /boot-se partition (vda1)
+#       created by the kickstart (Bug 19: plain partition, no PReP 4-10 MiB cap).
+#     - The .protvirt is a sealed SE image, not a zipl-signed kernel, so it boots via
+#       direct-kernel boot: libvirt <kernel> points at /boot-se/<file>.protvirt with
+#       roothash= on the kernel cmdline, without modifying vda2 (root) or vda3 (hash),
+#       preserving dm-verity integrity.
 #
 set -euo pipefail
 
@@ -41,8 +44,8 @@ Options (via environment variables or flags):
                                   Defaults to <INPUT_IMAGE_DIR>/<IMAGE_BASENAME>.protvirt
                                   (Env: OUTPUT_PROTVIRT)
   -w, --write-to-disk             Self-Contained "All-in-One" QCOW2 mode:
-                                  Writes the generated .protvirt payload directly into the PReP
-                                  boot partition (vda1) of the qcow2 image using zipl/dd without
+                                  Copies the generated .protvirt payload as a regular file onto
+                                  the ext4 /boot-se partition (vda1) of the qcow2 image without
                                   touching vda2, keeping dm-verity intact.
       --disk-out <PATH>           Output path for the modified qcow2 when using --write-to-disk.
                                   If omitted, writes directly to <INPUT_QCOW2_IMAGE>.
@@ -346,39 +349,39 @@ if [[ $WRITE_TO_DISK -eq 1 ]]; then
     fi
 
     echo "----------------------------------------------------------------"
-    echo " Embedding SE image into PReP boot partition of $TARGET_DISK..."
+    echo " Copying SE image onto the ext4 /boot-se partition of $TARGET_DISK..."
 
-    # Identify the PReP boot partition (usually /dev/sda1)
-    PREP_PART=$(guestfish --ro -a "$TARGET_DISK" run : list-partitions | grep -E 'sda1|vda1' | head -1 || true)
-    if [[ -z "$PREP_PART" ]]; then
-        PREP_PART=$(guestfish --ro -a "$TARGET_DISK" run : list-partitions | head -1)
+    # Identify the first partition (vda1/sda1) — the plain ext4 /boot-se
+    # partition created by the kickstart (Bug 19).
+    BOOT_PART=$(guestfish --ro -a "$TARGET_DISK" run : list-partitions | grep -E 'vda1|sda1' | head -1 || true)
+    if [[ -z "$BOOT_PART" ]]; then
+        BOOT_PART=$(guestfish --ro -a "$TARGET_DISK" run : list-partitions | head -1)
     fi
 
-    echo "Target PReP Partition: $PREP_PART"
+    echo "Target /boot-se partition: $BOOT_PART"
 
-    # Check partition size against the .protvirt file size
-    PREP_SIZE_BYTES=$(guestfish --ro -a "$TARGET_DISK" run : blockdev-getsize64 "$PREP_PART")
-    PROTVIRT_SIZE_BYTES=$(stat -c %s "$OUTPUT_PATH")
-
-    echo "PReP Partition Size  : $((PREP_SIZE_BYTES / 1024 / 1024)) MiB ($PREP_SIZE_BYTES bytes)"
-    echo "ProtVirt Image Size  : $((PROTVIRT_SIZE_BYTES / 1024 / 1024)) MiB ($PROTVIRT_SIZE_BYTES bytes)"
-
-    if [[ $PROTVIRT_SIZE_BYTES -gt $PREP_SIZE_BYTES ]]; then
-        echo "ERROR: The PReP boot partition ($PREP_PART) is too small ($((PREP_SIZE_BYTES / 1024 / 1024)) MiB) to hold the Secure Execution image ($((PROTVIRT_SIZE_BYTES / 1024 / 1024)) MiB)." >&2
-        echo "To use --write-to-disk (Path B), the base image kickstart needs a larger PReP partition (e.g. 64 MiB or 100 MiB: part prepboot --size=100)." >&2
-        echo "Alternatively, use Path A (direct SE kernel boot in Libvirt) using the standalone file:" >&2
-        echo "  $OUTPUT_PATH" >&2
-        exit 1
-    fi
-
-    # Write the .protvirt image into the PReP partition (vda1/sda1)
+    # Copy the .protvirt as a regular file onto the ext4 /boot-se filesystem.
+    # Mount at / (overlays the appliance root for this one-shot upload); the
+    # filesystem root of vda1 IS /boot-se, so uploading to /<file> lands at
+    # /boot-se/<file> in the VM. /tmp and /mnt do not exist in the guestfs
+    # appliance, so they cannot be used as mountpoints. mount is issued inside
+    # the run session (not via -m on the CLI) to avoid "this function can only
+    # be called in the config state".
     # vda2 (root) and vda3 (verity hash) are untouched, preserving dm-verity integrity.
-    guestfish -a "$TARGET_DISK" run : upload "$OUTPUT_PATH" "$PREP_PART"
+    # Boot via direct-kernel boot: libvirt <kernel> points at a host copy of the .protvirt
+    # with roothash= on the kernel cmdline.
+    guestfish -a "$TARGET_DISK" run : \
+        mount "$BOOT_PART" "/" : \
+        upload "$OUTPUT_PATH" "/$(basename "$OUTPUT_PATH")"
 
-    echo "Installed .protvirt payload into $PREP_PART on $TARGET_DISK."
+    SE_KERNEL_PATH="/boot-se/$(basename "$OUTPUT_PATH")"
+    echo "Installed .protvirt file into $SE_KERNEL_PATH on $TARGET_DISK."
     echo "================================================================"
     echo " All-in-One Self-Contained SE QCOW2 Image Created Successfully!"
-    echo " Output Image: $TARGET_DISK"
+    echo " Output Image : $TARGET_DISK"
+    echo " SE kernel    : $SE_KERNEL_PATH (file inside /boot-se of the qcow2)"
+    echo " Boot with    : <kernel>/path/to/$(basename "$OUTPUT_PATH")</kernel> on the host"
+    echo "              : plus roothash=$ROOTHASH on the kernel cmdline"
     echo "================================================================"
 else
     echo "================================================================"

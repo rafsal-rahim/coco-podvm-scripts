@@ -7,7 +7,7 @@
 text
 
 # No explicit repo directive: Anaconda automatically exposes both BaseOS and
-# AppStream from the mounted ISO when inst.repo=hd:/dev/vdb: is on the cmdline.
+# AppStream from the mounted ISO when inst.repo=hd:LABEL=<iso label>:/ is on the cmdline.
 # An explicit repo --baseurl= line is only needed for supplementary repos.
 
 %addon com_redhat_kdump --disable
@@ -59,15 +59,56 @@ e2fsprogs
 
 firstboot --disable
 
-# s390x disk is virtio-blk — exposed as vda
-ignoredisk --only-use=vda
-clearpart --none --initlabel
+# ── Target disk selection ─────────────────────────────────────────────────────
+# The installer VM has two virtio-blk disks: the blank target qcow2 and the
+# read-only install ISO.  The guest kernel names them vda/vdb in virtio probe
+# order, which is NOT stable between boots (Bug 17), so the target disk must not
+# be hard-coded.  %pre picks the writable, non-ISO9660 disk and generates the
+# partitioning commands into /tmp/part-include.
+%pre --erroronfail
+#!/bin/bash
+set -eu
+TARGET=""
+for d in /sys/block/vd*; do
+    [ -e "$d" ] || continue
+    name="${d##*/}"
+    # The install ISO is attached readonly=on -> /sys/block/<dev>/ro == 1
+    [ "$(cat "$d/ro")" = "0" ] || continue
+    # Belt and braces: never touch a disk that carries an ISO 9660 filesystem
+    [ "$(blkid -p -s TYPE -o value "/dev/$name" 2>/dev/null || true)" != "iso9660" ] || continue
+    if [ -n "$TARGET" ]; then
+        echo "ERROR: more than one writable virtio disk found ($TARGET, $name)" >&2
+        exit 1
+    fi
+    TARGET="$name"
+done
+if [ -z "$TARGET" ]; then
+    echo "ERROR: no writable virtio target disk found" >&2
+    exit 1
+fi
+echo "Kickstart target disk: $TARGET"
+echo "$TARGET" > /tmp/target-disk
 
 # Partition layout:
-#   vda1  4 MiB  PReP boot  — required by zipl on s390x
-#   vda2  rest   ext4 root  — typed with s390x DPS GUID in %post
-part prepboot  --fstype="prepboot" --ondisk=vda --size=4
-part /         --fstype="ext4"     --ondisk=vda --grow
+#   <disk>1  128 MiB /boot-se ext4 — holds the Secure Execution .protvirt image for
+#                                 --write-to-disk all-in-one SE qcow2 (Bug 19). A plain
+#                                 partition has no Anaconda/blivet PReP 4-10 MiB cap.
+#   <disk>2  rest    ext4 root  — typed with s390x DPS GUID in %post
+cat > /tmp/part-include <<EOF
+ignoredisk --only-use=${TARGET}
+clearpart --none --initlabel
+part /boot-se --fstype="ext4"     --ondisk=${TARGET} --size=128
+part /        --fstype="ext4"     --ondisk=${TARGET} --grow
+EOF
+%end
+
+%include /tmp/part-include
+
+# Hand the target disk name from the installer environment to the chrooted %post.
+%post --nochroot --erroronfail
+mkdir -p /mnt/sysroot/tmp
+cp /tmp/target-disk /mnt/sysroot/tmp/target-disk
+%end
 
 %post --erroronfail
 set -ex
@@ -76,7 +117,9 @@ set -ex
 # systemd-repart identifies the root partition by its GPT type UUID.
 # Anaconda sets a generic Linux data GUID; overwrite with the s390x-specific
 # Discoverable Partitions Spec value so verity-s390x.sh can find it later.
-sfdisk --part-type /dev/vda 2 08A7ACEA-624C-4A20-91E8-6E0FA67D23F9
+TARGET_DISK=$(cat /tmp/target-disk)
+sfdisk --part-type "/dev/${TARGET_DISK}" 2 08A7ACEA-624C-4A20-91E8-6E0FA67D23F9
+rm -f /tmp/target-disk
 
 # ── 2. Register with RHSM using credentials passed on the kernel cmdline ──────
 # helpers/build-s390x-base-image.sh appends:

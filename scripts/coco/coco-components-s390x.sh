@@ -161,10 +161,18 @@ else
     partprobe "$NBD_DEVICE" 2>/dev/null || true
     sleep 1
 
-    # 2. Find root partition (largest, same heuristic as verity-s390x.sh)
-    ROOT_PART=$(lsblk -rno NAME,SIZE "$NBD_DEVICE" \
-        | awk 'NR>1 {gsub(/[^0-9.]/, "", $2); print $2, $1}' \
-        | sort -rn | head -1 | awk '{print "/dev/"$2}')
+    # 2. Find root partition = partition 2 (Bug 19):
+    #    vda1 = /boot-se (plain 128 MiB), vda2 = root data, vda3 = verity hash.
+    #    Do NOT pick by size: vda1 is 128 MiB and could outrank a small hash
+    #    partition, which would mount the wrong filesystem.
+    NBD_BASE="${NBD_DEVICE#/dev/}"
+    ROOT_PART=$(lsblk -o NAME -r "$NBD_DEVICE" \
+        | tail -n +2 | grep -v "^${NBD_BASE} $" \
+        | awk -v dev="$NBD_BASE" '$0 ~ dev "p?2$|" dev "2$" {print "/dev/"$1; exit}')
+    if [[ -z "$ROOT_PART" ]]; then
+        echo "Error: could not find root partition (p2) on $NBD_DEVICE" >&2
+        exit 1
+    fi
     echo "Root partition: $ROOT_PART"
 
     # 3. fsck + mount
