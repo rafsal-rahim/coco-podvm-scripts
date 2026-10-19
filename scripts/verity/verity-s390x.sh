@@ -79,8 +79,14 @@ VERITY_FOLDER=${VERITY_FOLDER:-$(mktemp -d)}
 VERITY_FOLDER=$(realpath "$VERITY_FOLDER")
 
 # Space budget:
-#   LUKS scratch partition  — 2500 MiB reserved
-#   Verity hash partition   — 7 % of the current root size
+#   LUKS scratch partition  — 2500 MiB reserved at the END of the disk so
+#                             systemd-repart can create vda4 at runtime.
+#                             This space must remain UNALLOCATED in the GPT
+#                             after Stage 2 — do NOT let the verity partition
+#                             grow into it.
+#   Verity hash partition   — 7 % of the current root size, capped by
+#                             verity_max_space so it never consumes the scratch
+#                             budget.
 LUKS_MINIMAL_SPACE_MB=2500
 
 DISK_FORMAT=${DISK_FORMAT:-"raw"}
@@ -221,14 +227,20 @@ function create_verity_partition()
     fi
     echo "Root partition size: $root_part_bytes bytes"
 
+    # PaddingMinBytes on the verity partition ensures that systemd-repart
+    # leaves at least LUKS_MINIMAL_SPACE_MB of unallocated space after vda3.
+    # Without this, PaddingWeight=1 lets the verity partition grow to fill
+    # all free space — leaving padding=0B and no room for vda4 at runtime.
+    local scratch_bytes=$(( LUKS_MINIMAL_SPACE_MB * 1024 * 1024 ))
+
     cat > "$WORKDIR/verity.conf" <<EOF
 [Partition]
 Type=root-s390-verity
 Verity=hash
 VerityMatchKey=root
-PaddingWeight=1
 SizeMinBytes=64M
 SizeMaxBytes=${verity_max_space}
+PaddingMinBytes=${scratch_bytes}
 EOF
 
     cat > "$WORKDIR/root.conf" <<EOF
@@ -400,7 +412,14 @@ ConditionPathExists=!/run/zipl-done
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'touch /run/zipl-done && zipl --verbose && sync && poweroff -f'
+# Always poweroff after zipl, even if zipl segfaults (common under QEMU s390x
+# software emulation — qemu: uncaught target signal 11).  Without the ||, a
+# zipl segfault leaves the VM at a login prompt and virt-install --wait -1
+# hangs forever, causing the cleanup block to be skipped and /.autorelabel to
+# remain in the image.  veritysetup format then hashes a vda2 that still
+# contains /.autorelabel, and every subsequent boot triggers selinux-autorelabel
+# which writes to the dm-verity protected vda2, corrupting block 0.
+ExecStart=/bin/sh -c 'touch /run/zipl-done; zipl --verbose; sync; poweroff -f'
 StandardOutput=journal+console
 StandardError=journal+console
 
@@ -497,6 +516,12 @@ EOF
         mount "/dev/${ROOT_PN}" "$VERITY_FOLDER/mnt" && root_mounted=1
         rm -f "$VERITY_FOLDER/mnt/etc/systemd/system/multi-user.target.wants/zipl-bootmap-update.service"
         rm -f "$VERITY_FOLDER/mnt/etc/systemd/system/zipl-bootmap-update.service"
+        # Remove /.autorelabel so it does not trigger selinux-autorelabel again
+        # on every subsequent boot.  The zipl VM already ran fixfiles during its
+        # first boot; the labels are correct.  Leaving /.autorelabel in the
+        # verity-protected image would cause selinux-autorelabel to attempt
+        # writes to the read-only dm-verity device, corrupting block 0.
+        rm -f "$VERITY_FOLDER/mnt/.autorelabel"
         root_mounted=0; umount "$VERITY_FOLDER/mnt"
         qemu-nbd --disconnect "$NBD_DEVICE"; nbd_mounted=0
         udevadm settle; sleep 2
