@@ -232,6 +232,12 @@ ln -sf ../gen-issue.service \
     /etc/systemd/system/multi-user.target.wants/gen-issue.service
 
 # Extend PCR8 with the initdata digest after process-user-data runs
+#
+# The drop-in below mounts the CAA cidata ISO at /media/cidata. The RHEL 10
+# s390x base image has no /media/cidata, and the '-' prefix on ExecStartPre hides
+# the mount failure ("mount point does not exist"). process-user-data then finds
+# no user-data, generates dummy initdata, and CDH/AA get an empty initdata.
+mkdir -p /media/cidata
 mkdir -p /etc/systemd/system/process-user-data.service.d/
 cat <<'EOF' > /etc/systemd/system/process-user-data.service.d/10-override.conf
 [Service]
